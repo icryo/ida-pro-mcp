@@ -1025,6 +1025,7 @@ import ida_name
 import ida_ida
 import ida_frame
 import ida_segment
+import ida_struct
 
 ida_major, ida_minor = map(int, idaapi.get_kernel_version().split("."))
 
@@ -2772,6 +2773,411 @@ def data_read_string(
         return idaapi.get_strlit_contents(parse_address(address),-1,0).decode("utf-8")
     except Exception as e:
         return "Error:" + str(e)
+
+# =============================================================================
+# Byte Pattern Search
+# =============================================================================
+
+class SearchMatch(TypedDict):
+    address: str
+    context: str  # hex bytes around the match
+
+@jsonrpc
+@idaread
+def search_bytes(
+    pattern: Annotated[str, "Hex pattern to search for. Use ?? for wildcards. Example: '48 8B ?? ?? ?? ?? 00' or '488B??????00'"],
+    start_address: Annotated[Optional[str], "Start address for search (default: start of binary)"] = None,
+    max_results: Annotated[int, "Maximum number of results to return (default: 100)"] = 100
+) -> list[SearchMatch]:
+    """
+    Search for a byte pattern in the binary. Supports wildcards with ?? for single byte wildcards.
+    Returns addresses where the pattern was found along with surrounding context bytes.
+    """
+    # Normalize pattern: remove spaces and convert to uppercase
+    pattern = pattern.replace(" ", "").upper()
+
+    # Validate pattern (should be hex chars and ? only, even length)
+    if len(pattern) % 2 != 0:
+        raise IDAError("Pattern must have even number of characters (each byte is 2 hex chars)")
+
+    for i in range(0, len(pattern), 2):
+        byte_str = pattern[i:i+2]
+        if byte_str != "??" and not all(c in "0123456789ABCDEF" for c in byte_str):
+            raise IDAError(f"Invalid byte pattern at position {i}: '{byte_str}'. Use hex chars or ?? for wildcard.")
+
+    # Convert to IDA binary search pattern
+    # IDA uses: "48 8B ? ? ? ? 00" format with single ? per nibble
+    ida_pattern = ""
+    for i in range(0, len(pattern), 2):
+        byte_str = pattern[i:i+2]
+        if byte_str == "??":
+            ida_pattern += "? "
+        else:
+            ida_pattern += byte_str + " "
+    ida_pattern = ida_pattern.strip()
+
+    # Determine search range
+    if start_address:
+        start_ea = parse_address(start_address)
+    else:
+        start_ea = idaapi.inf_get_min_ea()
+
+    end_ea = idaapi.inf_get_max_ea()
+
+    results = []
+    current_ea = start_ea
+
+    while len(results) < max_results:
+        # Search for pattern
+        found_ea = ida_bytes.find_binary(current_ea, end_ea, ida_pattern, 16, ida_bytes.BIN_SEARCH_FORWARD)
+
+        if found_ea == idaapi.BADADDR:
+            break
+
+        # Get context bytes (8 bytes before and after)
+        context_start = max(found_ea - 8, idaapi.inf_get_min_ea())
+        context_end = min(found_ea + len(pattern) // 2 + 8, idaapi.inf_get_max_ea())
+        context_bytes = ida_bytes.get_bytes(context_start, context_end - context_start)
+
+        if context_bytes:
+            context_hex = context_bytes.hex(" ").upper()
+        else:
+            context_hex = ""
+
+        results.append(SearchMatch(
+            address=hex(found_ea),
+            context=context_hex
+        ))
+
+        # Move past this match
+        current_ea = found_ea + 1
+
+    return results
+
+# =============================================================================
+# Comment Management
+# =============================================================================
+
+class CommentInfo(TypedDict):
+    address: str
+    regular: Optional[str]
+    repeatable: Optional[str]
+    anterior: list[str]
+    posterior: list[str]
+    function_comment: Optional[str]
+
+@jsonrpc
+@idaread
+def get_comments(
+    address: Annotated[str, "Address to get comments from"]
+) -> CommentInfo:
+    """
+    Get all comments at the specified address including regular, repeatable, anterior, and posterior comments.
+    If the address is within a function, also returns the function comment.
+    """
+    ea = parse_address(address)
+
+    # Get regular and repeatable comments
+    regular = ida_bytes.get_cmt(ea, False)  # False = regular comment
+    repeatable = ida_bytes.get_cmt(ea, True)  # True = repeatable comment
+
+    # Get anterior lines (comments before the address)
+    anterior = []
+    for i in range(ida_lines.get_first_free_extra_cmtidx(ea, ida_lines.E_PREV)):
+        line = ida_lines.get_extra_cmt(ea, ida_lines.E_PREV + i)
+        if line:
+            anterior.append(line)
+
+    # Get posterior lines (comments after the address)
+    posterior = []
+    for i in range(ida_lines.get_first_free_extra_cmtidx(ea, ida_lines.E_NEXT)):
+        line = ida_lines.get_extra_cmt(ea, ida_lines.E_NEXT + i)
+        if line:
+            posterior.append(line)
+
+    # Get function comment if address is in a function
+    function_comment = None
+    func = ida_funcs.get_func(ea)
+    if func:
+        function_comment = ida_funcs.get_func_cmt(func, False)  # False = regular, True = repeatable
+        if not function_comment:
+            function_comment = ida_funcs.get_func_cmt(func, True)
+
+    return CommentInfo(
+        address=hex(ea),
+        regular=regular if regular else None,
+        repeatable=repeatable if repeatable else None,
+        anterior=anterior,
+        posterior=posterior,
+        function_comment=function_comment
+    )
+
+@jsonrpc
+@idawrite
+def add_comment(
+    address: Annotated[str, "Address to add comment to"],
+    comment: Annotated[str, "Comment text to add"],
+    comment_type: Annotated[str, "Type of comment: 'regular', 'repeatable', 'anterior', 'posterior', or 'function'"] = "regular"
+) -> dict:
+    """
+    Add a comment at the specified address.
+
+    Comment types:
+    - regular: Standard comment shown at the address
+    - repeatable: Comment that appears at all references to this address
+    - anterior: Comment line(s) shown before the address
+    - posterior: Comment line(s) shown after the address
+    - function: Comment for the entire function (address must be within a function)
+    """
+    ea = parse_address(address)
+
+    if comment_type == "regular":
+        success = ida_bytes.set_cmt(ea, comment, False)
+    elif comment_type == "repeatable":
+        success = ida_bytes.set_cmt(ea, comment, True)
+    elif comment_type == "anterior":
+        # Add as anterior line
+        idx = ida_lines.get_first_free_extra_cmtidx(ea, ida_lines.E_PREV)
+        ida_lines.update_extra_cmt(ea, ida_lines.E_PREV + idx, comment)
+        success = True
+    elif comment_type == "posterior":
+        # Add as posterior line
+        idx = ida_lines.get_first_free_extra_cmtidx(ea, ida_lines.E_NEXT)
+        ida_lines.update_extra_cmt(ea, ida_lines.E_NEXT + idx, comment)
+        success = True
+    elif comment_type == "function":
+        func = ida_funcs.get_func(ea)
+        if not func:
+            raise IDAError(f"Address {hex(ea)} is not within a function")
+        success = ida_funcs.set_func_cmt(func, comment, False)
+    else:
+        raise IDAError(f"Invalid comment type: {comment_type}. Must be 'regular', 'repeatable', 'anterior', 'posterior', or 'function'")
+
+    return {
+        "success": success,
+        "address": hex(ea),
+        "comment_type": comment_type,
+        "comment": comment
+    }
+
+@jsonrpc
+@idawrite
+def delete_comment(
+    address: Annotated[str, "Address to delete comment from"],
+    comment_type: Annotated[str, "Type of comment to delete: 'regular', 'repeatable', 'anterior', 'posterior', or 'function'"] = "regular"
+) -> dict:
+    """
+    Delete a comment at the specified address.
+    For anterior/posterior, deletes all lines.
+    """
+    ea = parse_address(address)
+
+    if comment_type == "regular":
+        success = ida_bytes.set_cmt(ea, "", False)
+    elif comment_type == "repeatable":
+        success = ida_bytes.set_cmt(ea, "", True)
+    elif comment_type == "anterior":
+        # Delete all anterior lines
+        ida_lines.del_extra_cmt(ea, ida_lines.E_PREV)
+        success = True
+    elif comment_type == "posterior":
+        # Delete all posterior lines
+        ida_lines.del_extra_cmt(ea, ida_lines.E_NEXT)
+        success = True
+    elif comment_type == "function":
+        func = ida_funcs.get_func(ea)
+        if not func:
+            raise IDAError(f"Address {hex(ea)} is not within a function")
+        success = ida_funcs.set_func_cmt(func, "", False)
+    else:
+        raise IDAError(f"Invalid comment type: {comment_type}")
+
+    return {
+        "success": success,
+        "address": hex(ea),
+        "comment_type": comment_type
+    }
+
+# =============================================================================
+# Control Flow Graph
+# =============================================================================
+
+class BasicBlock(TypedDict):
+    start_address: str
+    end_address: str
+    instructions: list[str]
+    successors: list[str]  # addresses of successor blocks
+    predecessors: list[str]  # addresses of predecessor blocks
+
+class ControlFlowGraph(TypedDict):
+    function_address: str
+    function_name: str
+    blocks: list[BasicBlock]
+    entry_block: str
+    exit_blocks: list[str]
+
+@jsonrpc
+@idaread
+def get_function_cfg(
+    address: Annotated[str, "Address of the function to analyze"]
+) -> ControlFlowGraph:
+    """
+    Get the control flow graph of a function, including all basic blocks and their connections.
+    Returns basic blocks with their instructions and successor/predecessor relationships.
+    """
+    ea = parse_address(address)
+    func = ida_funcs.get_func(ea)
+
+    if not func:
+        raise IDAError(f"No function found at address {hex(ea)}")
+
+    # Get the flow chart (CFG) for the function
+    flowchart = idaapi.FlowChart(func)
+
+    blocks = []
+    exit_blocks = []
+    entry_block = None
+
+    for block in flowchart:
+        # Get instructions in this block
+        instructions = []
+        current_ea = block.start_ea
+        while current_ea < block.end_ea:
+            insn = ida_lines.generate_disasm_line(current_ea, 0)
+            if insn:
+                # Clean up the disassembly line
+                insn = ida_lines.tag_remove(insn)
+                instructions.append(f"{hex(current_ea)}: {insn}")
+            current_ea = idaapi.next_head(current_ea, block.end_ea)
+
+        # Get successors
+        successors = []
+        for succ_idx in range(block.nsucc()):
+            succ_block = block.succ(succ_idx)
+            successors.append(hex(succ_block.start_ea))
+
+        # Get predecessors
+        predecessors = []
+        for pred_idx in range(block.npred()):
+            pred_block = block.pred(pred_idx)
+            predecessors.append(hex(pred_block.start_ea))
+
+        # Track entry and exit blocks
+        if block.start_ea == func.start_ea:
+            entry_block = hex(block.start_ea)
+
+        if len(successors) == 0 or block.type == idaapi.fcb_ret:
+            exit_blocks.append(hex(block.start_ea))
+
+        blocks.append(BasicBlock(
+            start_address=hex(block.start_ea),
+            end_address=hex(block.end_ea),
+            instructions=instructions,
+            successors=successors,
+            predecessors=predecessors
+        ))
+
+    func_name = ida_funcs.get_func_name(func.start_ea)
+
+    return ControlFlowGraph(
+        function_address=hex(func.start_ea),
+        function_name=func_name if func_name else f"sub_{func.start_ea:x}",
+        blocks=blocks,
+        entry_block=entry_block if entry_block else hex(func.start_ea),
+        exit_blocks=exit_blocks
+    )
+
+# =============================================================================
+# Script Execution
+# =============================================================================
+
+class ScriptResult(TypedDict):
+    success: bool
+    output: str
+    error: Optional[str]
+    return_value: Optional[str]
+
+@jsonrpc
+@idawrite
+def execute_script(
+    code: Annotated[str, "Python code to execute in the IDA environment"],
+    timeout_seconds: Annotated[int, "Maximum execution time in seconds (default: 30)"] = 30
+) -> ScriptResult:
+    """
+    Execute arbitrary IDAPython code in the IDA environment.
+
+    The code has access to all IDA modules (idaapi, ida_funcs, ida_bytes, etc.).
+    Use 'result' variable to return a value from the script.
+
+    WARNING: This is a powerful tool - use with caution as it can modify the database.
+
+    Example:
+        code = '''
+        # Count functions with more than 100 instructions
+        count = 0
+        for func_ea in idautils.Functions():
+            func = ida_funcs.get_func(func_ea)
+            if func and func.end_ea - func.start_ea > 100:
+                count += 1
+        result = f"Found {count} large functions"
+        '''
+    """
+    import io
+    import contextlib
+
+    # Capture stdout/stderr
+    stdout_capture = io.StringIO()
+    stderr_capture = io.StringIO()
+
+    # Prepare execution environment with IDA modules
+    exec_globals = {
+        '__builtins__': __builtins__,
+        'idaapi': idaapi,
+        'ida_funcs': ida_funcs,
+        'ida_bytes': ida_bytes,
+        'ida_hexrays': ida_hexrays,
+        'ida_name': ida_name,
+        'ida_typeinf': ida_typeinf,
+        'ida_lines': ida_lines,
+        'ida_xref': ida_xref,
+        'ida_segment': ida_segment,
+        'ida_frame': ida_frame,
+        'ida_struct': ida_struct,
+        'ida_nalt': ida_nalt,
+        'ida_kernwin': ida_kernwin,
+        'idautils': idautils,
+        'idc': idc,
+        'result': None,  # User can set this to return a value
+    }
+
+    error_msg = None
+    return_value = None
+
+    try:
+        with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
+            # Execute the code
+            exec(code, exec_globals)
+
+        # Get the result if user set it
+        if 'result' in exec_globals and exec_globals['result'] is not None:
+            return_value = str(exec_globals['result'])
+
+        success = True
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        success = False
+
+    output = stdout_capture.getvalue()
+    stderr_output = stderr_capture.getvalue()
+    if stderr_output:
+        output += f"\n[stderr]\n{stderr_output}"
+
+    return ScriptResult(
+        success=success,
+        output=output.strip() if output else "",
+        error=error_msg,
+        return_value=return_value
+    )
 
 class RegisterValue(TypedDict):
     name: str

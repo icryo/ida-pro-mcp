@@ -6,6 +6,15 @@ https://github.com/user-attachments/assets/6ebeaa92-a9db-43fa-b756-eececce2aca0
 
 The binaries and prompt for the video are available in the [mcp-reversing-dataset](https://github.com/mrexodia/mcp-reversing-dataset) repository.
 
+## New in v1.6.0
+
+- **Dynamic Database Loading**: Start headless server without a binary, load/switch files on demand
+- **Database Persistence**: Save analysis to disk with `save_database()`
+- **Byte Pattern Search**: Find hex patterns with wildcards using `search_bytes()`
+- **Comment Management**: Full support for regular, repeatable, anterior, posterior, and function comments
+- **Control Flow Graphs**: Analyze function structure with `get_function_cfg()`
+- **Script Execution**: Run arbitrary IDAPython code via `execute_script()`
+
 Available functionality:
 
 - `check_connection()`: Check if the IDA plugin is running.
@@ -58,6 +67,19 @@ Available functionality:
 - `data_read_dword(address)`: Read the 4 byte value at the specified address as a DWORD.
 - `data_read_qword(address)`: Read the 8 byte value at the specified address as a QWORD.
 - `data_read_string(address)`: Read the string at the specified address.
+- `search_bytes(pattern, start_address, max_results)`: Search for byte patterns with wildcards (e.g., "48 8B ?? ?? ?? ?? 00").
+- `get_comments(address)`: Get all comments at an address (regular, repeatable, anterior, posterior, function).
+- `add_comment(address, comment, comment_type)`: Add a comment at an address.
+- `delete_comment(address, comment_type)`: Delete a comment at an address.
+- `get_function_cfg(address)`: Get control flow graph with basic blocks, successors, and predecessors.
+- `execute_script(code, timeout_seconds)`: Execute arbitrary IDAPython code with access to all IDA modules.
+
+Headless server tools (idalib-mcp only):
+
+- `load_database(path, run_auto_analysis)`: Load a binary file or IDB for analysis.
+- `close_database()`: Close the currently open database.
+- `save_database(path)`: Save the current database to disk (preserves all analysis).
+- `get_database_status()`: Check if a database is loaded and get its path.
 
 Unsafe functions (`--unsafe` flag required):
 
@@ -100,7 +122,7 @@ Install the latest version of the IDA Pro MCP package:
 
 ```sh
 pip uninstall ida-pro-mcp
-pip install https://github.com/mrexodia/ida-pro-mcp/archive/refs/heads/main.zip
+pip install https://github.com/icryo/ida-pro-mcp/archive/refs/heads/main.zip
 ```
 
 Configure the MCP servers and install the IDA Plugin:
@@ -161,10 +183,39 @@ uv run ida-pro-mcp --transport http://127.0.0.1:8744/sse
 After installing [`idalib`](https://docs.hex-rays.com/user-guide/idalib) you can also run a headless SSE server:
 
 ```sh
+# Start with a specific binary (backwards compatible)
 uv run idalib-mcp --host 127.0.0.1 --port 8745 path/to/executable
+
+# Or start without a binary (new in v1.6.0)
+uv run idalib-mcp --host 127.0.0.1 --port 8745
 ```
 
-_Note_: The `idalib` feature was contributed by [Willi Ballenthin](https://github.com/williballenthin).
+### Dynamic Database Loading (v1.6.0)
+
+The headless server now supports loading and switching binaries dynamically:
+
+```python
+# Start server without a binary
+# uv run idalib-mcp --port 8745
+
+# Then via MCP tools:
+load_database("/path/to/malware.exe")           # Load binary
+# ... analyze, rename functions, add comments ...
+save_database()                                   # Save to malware.i64
+save_database("/backups/malware_v1.i64")        # Create backup
+
+load_database("/path/to/other.dll")             # Switch to another binary
+get_database_status()                            # Check current state
+close_database()                                  # Close without opening another
+```
+
+This enables:
+- Analyzing multiple binaries in one session
+- Creating analysis snapshots before risky operations
+- Persisting analysis between sessions
+- Team sharing of analyzed IDB files
+
+_Note_: The original `idalib` feature was contributed by [Willi Ballenthin](https://github.com/williballenthin).
 
 ## Manual Installation
 
@@ -188,7 +239,7 @@ To install the MCP server yourself, follow these steps:
 ```json
 {
   "mcpServers": {
-    "github.com/mrexodia/ida-pro-mcp": {
+    "github.com/icryo/ida-pro-mcp": {
       "command": "uv",
       "args": [
         "--directory",
@@ -208,7 +259,7 @@ To check if the connection works you can perform the following tool call:
 
 ```
 <use_mcp_tool>
-<server_name>github.com/mrexodia/ida-pro-mcp</server_name>
+<server_name>github.com/icryo/ida-pro-mcp</server_name>
 <tool_name>check_connection</tool_name>
 <arguments></arguments>
 </use_mcp_tool>

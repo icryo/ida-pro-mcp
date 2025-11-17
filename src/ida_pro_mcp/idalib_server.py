@@ -10,8 +10,12 @@ import typing_inspection.introspection as intro
 
 from mcp.server.fastmcp import FastMCP
 
-# idapro must go first to initialize idalib
-import idapro
+# ida/idapro must go first to initialize idalib
+# IDA 9.0+ uses 'ida' module, IDA 8.x uses 'idapro'
+try:
+    import ida as idapro  # IDA 9.0+
+except ImportError:
+    import idapro  # IDA 8.x
 
 import ida_auto
 import ida_hexrays
@@ -285,10 +289,12 @@ def main():
 
     if args.verbose:
         log_level = logging.DEBUG
-        idapro.enable_console_messages(True)
+        if hasattr(idapro, 'enable_console_messages'):
+            idapro.enable_console_messages(True)
     else:
         log_level = logging.INFO
-        idapro.enable_console_messages(False)
+        if hasattr(idapro, 'enable_console_messages'):
+            idapro.enable_console_messages(False)
 
     mcp.settings.log_level = logging.getLevelName(log_level)
     mcp.settings.host = args.host

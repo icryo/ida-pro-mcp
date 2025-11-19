@@ -5,7 +5,7 @@ import logging
 import argparse
 import importlib
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Optional, Any
 import typing_inspection.introspection as intro
 
 from mcp.server.fastmcp import FastMCP
@@ -45,7 +45,7 @@ def _wrap_with_db_check(func):
     return wrapper
 
 def _register_ida_tools():
-    """Register IDA tools from mcp-plugin.py after database is loaded"""
+    """Register IDA tools from mcp-plugin.py - must be called at startup"""
     if _db_state["tools_registered"]:
         logger.debug("IDA tools already registered")
         return
@@ -66,8 +66,8 @@ def _register_ida_tools():
 @mcp.tool()
 def load_database(
     path: Annotated[str, "Path to the binary file or IDB to analyze"],
-    run_auto_analysis: Annotated[bool, "Run automatic analysis after loading (default: True)"] = True
-) -> dict:
+    run_auto_analysis: Annotated[bool, "Run automatic analysis after loading"] = True
+) -> dict[str, Any]:
     """Load a new binary file or IDB database for analysis. Closes any currently open database first."""
     global _db_state
 
@@ -98,9 +98,6 @@ def load_database(
     _db_state["loaded"] = True
     _db_state["path"] = str(input_path.absolute())
 
-    # Register IDA tools on first database load
-    _register_ida_tools()
-
     return {
         "success": True,
         "path": _db_state["path"],
@@ -108,7 +105,7 @@ def load_database(
     }
 
 @mcp.tool()
-def close_database() -> dict:
+def close_database() -> dict[str, Any]:
     """Close the currently open database."""
     global _db_state
 
@@ -130,7 +127,7 @@ def close_database() -> dict:
 @mcp.tool()
 def save_database(
     path: Annotated[Optional[str], "Optional path to save the database to. If not provided, saves to the current IDB path."] = None
-) -> dict:
+) -> dict[str, Any]:
     """
     Save the current database to disk. This preserves all analysis including:
     - Function names and boundaries
@@ -184,7 +181,7 @@ def save_database(
         }
 
 @mcp.tool()
-def get_database_status() -> dict:
+def get_database_status() -> dict[str, Any]:
     """Get the current database status - whether a database is loaded and its path."""
     return {
         "loaded": _db_state["loaded"],
@@ -325,11 +322,12 @@ def main():
 
         _db_state["loaded"] = True
         _db_state["path"] = str(args.input_path.absolute())
-
-        # Register IDA tools immediately since we have a database
-        _register_ida_tools()
     else:
         logger.info("Starting without a database. Use load_database tool to load a binary.")
+
+    # Register IDA tools at startup (MCP doesn't support dynamic tool registration)
+    # Tools will check if database is loaded before executing
+    _register_ida_tools()
 
     # Setup signal handlers to ensure IDA database is properly closed on shutdown.
     #

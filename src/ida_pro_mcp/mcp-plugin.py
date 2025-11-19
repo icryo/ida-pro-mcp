@@ -16,15 +16,14 @@ from typing import (
     Any,
     Callable,
     get_type_hints,
-    TypedDict,
     Optional,
     Annotated,
     TypeVar,
     Generic,
-    NotRequired,
     overload,
     Literal,
 )
+from typing_extensions import TypedDict, NotRequired
 
 class JSONRPCError(Exception):
     def __init__(self, code: int, message: str, data: Any = None):
@@ -1025,7 +1024,7 @@ import ida_name
 import ida_ida
 import ida_frame
 import ida_segment
-import ida_struct
+# ida_struct is imported lazily when needed (in execute_script)
 
 ida_major, ida_minor = map(int, idaapi.get_kernel_version().split("."))
 
@@ -1434,8 +1433,14 @@ class Page(TypedDict, Generic[T]):
     next_offset: Optional[int]
 
 def paginate(data: list[T], offset: int, count: int) -> Page[T]:
+    MAX_PAGE_SIZE = 500  # Hard limit to prevent token overflow
+
     if count == 0:
         count = len(data)
+
+    # Cap count to maximum page size
+    count = min(count, MAX_PAGE_SIZE)
+
     next_offset = offset + count
     if next_offset >= len(data):
         next_offset = None
@@ -2162,8 +2167,13 @@ def get_global_variable_value_internal(ea: int) -> str:
      elif size == 8:
          return hex(ida_bytes.get_qword(ea))
      else:
-         # For other sizes, return the raw bytes
-         return ' '.join(hex(x) for x in ida_bytes.get_bytes(ea, size))
+         # For other sizes, return the raw bytes (limit to 1KB to avoid token overflow)
+         MAX_BYTES = 1024
+         if size > MAX_BYTES:
+             truncated_bytes = ida_bytes.get_bytes(ea, MAX_BYTES)
+             return f"[First {MAX_BYTES} bytes of {size} total] " + ' '.join(hex(x) for x in truncated_bytes) + " ..."
+         else:
+             return ' '.join(hex(x) for x in ida_bytes.get_bytes(ea, size))
 
 @jsonrpc
 @idawrite
@@ -3125,6 +3135,14 @@ def execute_script(
     import io
     import contextlib
 
+    # Try to import ida_struct - only available after database is loaded
+    try:
+        import ida_struct
+        has_ida_struct = True
+    except ImportError:
+        ida_struct = None
+        has_ida_struct = False
+
     # Capture stdout/stderr
     stdout_capture = io.StringIO()
     stderr_capture = io.StringIO()
@@ -3142,13 +3160,16 @@ def execute_script(
         'ida_xref': ida_xref,
         'ida_segment': ida_segment,
         'ida_frame': ida_frame,
-        'ida_struct': ida_struct,
         'ida_nalt': ida_nalt,
         'ida_kernwin': ida_kernwin,
         'idautils': idautils,
         'idc': idc,
         'result': None,  # User can set this to return a value
     }
+
+    # Only add ida_struct if it's available
+    if has_ida_struct:
+        exec_globals['ida_struct'] = ida_struct
 
     error_msg = None
     return_value = None
